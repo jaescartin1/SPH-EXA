@@ -42,6 +42,8 @@ namespace sphexa
 template<class DomainType, class ParticleDataType>
 class Propagator
 {
+    using T = typename ParticleDataType::RealType;
+
 public:
     Propagator(size_t ngmax, size_t ng0, std::ostream& output, size_t rank)
         : timer(output, rank)
@@ -62,7 +64,7 @@ public:
 
     virtual void step(DomainType& domain, ParticleDataType& d) = 0;
 
-    virtual void prepareOutput(ParticleDataType& d, size_t startIndex, size_t endIndex){};
+    virtual void prepareOutput(ParticleDataType& d, size_t startIndex, size_t endIndex, const cstone::Box<T>&){};
     virtual void finishOutput(ParticleDataType& d){};
 
     //! @brief this allows the possibility of saving propagator data to file if it is stateful
@@ -73,8 +75,9 @@ public:
 
     virtual ~Propagator() = default;
 
-    void printIterationTimings(const DomainType& domain, const ParticleDataType& d)
+    void printIterationTimings(const DomainType& domain, const ParticleDataType& simData)
     {
+        const auto& d = simData.hydro;
         if (rank_ == 0)
         {
             printCheck(d.ttot, d.minDt, d.etot, d.eint, d.ecin, d.egrav, domain.box(), d.numParticlesGlobal,

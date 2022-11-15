@@ -81,7 +81,7 @@ std::array<Tc, 3> localGrowthRate(size_t startIndex, size_t endIndex, const Tc* 
  * @param[in]     box          bounding box
  */
 template<typename T, class Dataset>
-T computeKHGrowthRate(size_t startIndex, size_t endIndex, Dataset& d, const cstone::Box<T>& box)
+T computeKHGrowthRate(size_t startIndex, size_t endIndex, Dataset& d, const cstone::Box<T>& box, MPI_Comm comm)
 {
     if (d.kx.empty())
     {
@@ -93,7 +93,7 @@ T computeKHGrowthRate(size_t startIndex, size_t endIndex, Dataset& d, const csto
 
     int              rootRank = 0;
     std::array<T, 3> sum;
-    MPI_Reduce(localSum.data(), sum.data(), 3, MpiType<T>{}, MPI_SUM, rootRank, MPI_COMM_WORLD);
+    MPI_Reduce(localSum.data(), sum.data(), 3, MpiType<T>{}, MPI_SUM, rootRank, comm);
 
     return 2.0 * std::sqrt(sum[0] * sum[0] + sum[1] * sum[1]) / sum[2];
 }
@@ -112,29 +112,19 @@ public:
 
     using T = typename Dataset::RealType;
 
-    void computeAndWrite(Dataset& d, size_t firstIndex, size_t lastIndex, cstone::Box<T>& box)
+    void computeAndWrite(Dataset& simData, size_t firstIndex, size_t lastIndex, cstone::Box<T>& box)
     {
-        d.totalNeighbors = neighborsSum(firstIndex, lastIndex, d.neighborsCount);
-        computeConservedQuantities(firstIndex, lastIndex, d);
-        T khgr = computeKHGrowthRate<T>(firstIndex, lastIndex, d, box);
+        auto& d = simData.hydro;
+        computeConservedQuantities(firstIndex, lastIndex, d, simData.comm);
+        T khgr = computeKHGrowthRate<T>(firstIndex, lastIndex, d, box, simData.comm);
 
         int rank;
-        MPI_Comm_rank(d.comm, &rank);
+        MPI_Comm_rank(simData.comm, &rank);
 
         if (rank == 0)
         {
-            fileutils::writeColumns(constantsFile,
-                                    ' ',
-                                    d.iteration,
-                                    d.ttot,
-                                    d.minDt,
-                                    d.etot,
-                                    d.ecin,
-                                    d.eint,
-                                    d.egrav,
-                                    d.linmom,
-                                    d.angmom,
-                                    khgr);
+            fileutils::writeColumns(constantsFile, ' ', d.iteration, d.ttot, d.minDt, d.etot, d.ecin, d.eint, d.egrav,
+                                    d.linmom, d.angmom, khgr);
         }
     }
 };

@@ -34,13 +34,16 @@
 #include <vector>
 #include <variant>
 
-#include "cstone/util/util.hpp"
+#include "cstone/cuda/cuda_utils.hpp"
+#include "cstone/tree/accel_switch.hpp"
+#include "cstone/tree/definitions.h"
+#include "cstone/util/reallocate.hpp"
 
 #include "sph/kernels.hpp"
 #include "sph/tables.hpp"
 
-#include "data_util.hpp"
-#include "field_states.hpp"
+#include "cstone/fields/data_util.hpp"
+#include "cstone/fields/field_states.hpp"
 #include "particles_data_stubs.hpp"
 
 #if defined(USE_CUDA)
@@ -51,12 +54,14 @@
 namespace sphexa
 {
 
-template<typename T, typename I, class AccType>
-class ParticlesData : public FieldStates<ParticlesData<T, I, AccType>>
+template<typename T, typename KeyType_, class AccType>
+class ParticlesData : public cstone::FieldStates<ParticlesData<T, KeyType_, AccType>>
 {
 public:
+    using KeyType         = KeyType_;
     using RealType        = T;
-    using KeyType         = I;
+    using Tmass           = float;
+    using XM1Type         = float;
     using AcceleratorType = AccType;
 
     template<class ValueType>
@@ -85,37 +90,40 @@ public:
 
     //! @brief adiabatic index
     T gamma{5.0 / 3.0};
+    //! @brief mean molecular weight of ions for models that use one value for all particles
+    T muiConst{10.0};
 
     /*! @brief Particle fields
      *
      * The length of these arrays equals the local number of particles including halos
      * if the field is active and is zero if the field is inactive.
      */
-    FieldVector<T>       x, y, z, x_m1, y_m1, z_m1;    // Positions
-    FieldVector<T>       vx, vy, vz;                   // Velocities
-    FieldVector<T>       rho;                          // Density
-    FieldVector<T>       temp;                         // Temperature
-    FieldVector<T>       u;                            // Internal Energy
-    FieldVector<T>       p;                            // Pressure
-    FieldVector<T>       prho;                         // p / (kx * m^2 * gradh)
-    FieldVector<T>       h;                            // Smoothing Length
-    FieldVector<T>       m;                            // Mass
-    FieldVector<T>       c;                            // Speed of sound
-    FieldVector<T>       cv;                           // Specific heat
-    FieldVector<T>       mue, mui;                     // mean molecular weight (electrons, ions)
-    FieldVector<T>       divv, curlv;                  // Div(velocity), Curl(velocity)
-    FieldVector<T>       ax, ay, az;                   // acceleration
-    FieldVector<T>       du, du_m1;                    // energy rate of change (du/dt)
-    FieldVector<T>       c11, c12, c13, c22, c23, c33; // IAD components
-    FieldVector<T>       alpha;                        // AV coeficient
-    FieldVector<T>       xm;                           // Volume element definition
-    FieldVector<T>       kx;                           // Volume element normalization
-    FieldVector<T>       gradh;                        // grad(h) term
-    std::vector<KeyType> codes;                        // Particle space-filling-curve keys
-    PinnedVec<int>       neighborsCount;               // number of neighbors of each particle
+    FieldVector<T>        x, y, z;                      // Positions
+    FieldVector<XM1Type>  x_m1, y_m1, z_m1;             // Difference between current and previous positions
+    FieldVector<T>        vx, vy, vz;                   // Velocities
+    FieldVector<T>        rho;                          // Density
+    FieldVector<T>        temp;                         // Temperature
+    FieldVector<T>        u;                            // Internal Energy
+    FieldVector<T>        p;                            // Pressure
+    FieldVector<T>        prho;                         // p / (kx * m^2 * gradh)
+    FieldVector<T>        h;                            // Smoothing Length
+    FieldVector<Tmass>    m;                            // Mass
+    FieldVector<T>        c;                            // Speed of sound
+    FieldVector<T>        cv;                           // Specific heat
+    FieldVector<T>        mue, mui;                     // mean molecular weight (electrons, ions)
+    FieldVector<T>        divv, curlv;                  // Div(velocity), Curl(velocity)
+    FieldVector<T>        ax, ay, az;                   // acceleration
+    FieldVector<XM1Type>  du, du_m1;                    // energy rate of change (du/dt)
+    FieldVector<T>        c11, c12, c13, c22, c23, c33; // IAD components
+    FieldVector<T>        alpha;                        // AV coeficient
+    FieldVector<T>        xm;                           // Volume element definition
+    FieldVector<T>        kx;                           // Volume element normalization
+    FieldVector<T>        gradh;                        // grad(h) term
+    FieldVector<KeyType>  keys;                         // Particle space-filling-curve keys
+    FieldVector<unsigned> nc;                           // number of neighbors of each particle
 
     //! @brief Indices of neighbors for each particle, length is number of assigned particles * ngmax. CPU version only.
-    std::vector<int> neighbors;
+    std::vector<cstone::LocalIndex> neighbors;
 
     DeviceData_t<AccType, T, KeyType> devData;
 
@@ -140,9 +148,8 @@ public:
      */
     auto dataTuple()
     {
-        auto ret =
-            std::tie(x, y, z, x_m1, y_m1, z_m1, vx, vy, vz, rho, u, p, prho, h, m, c, ax, ay, az, du, du_m1, c11, c12,
-                     c13, c22, c23, c33, mue, mui, temp, cv, xm, kx, divv, curlv, alpha, gradh, codes, neighborsCount);
+        auto ret = std::tie(x, y, z, x_m1, y_m1, z_m1, vx, vy, vz, rho, u, p, prho, h, m, c, ax, ay, az, du, du_m1, c11,
+                            c12, c13, c22, c23, c33, mue, mui, temp, cv, xm, kx, divv, curlv, alpha, gradh, keys, nc);
 
         static_assert(std::tuple_size_v<decltype(ret)> == fieldNames.size());
         return ret;
@@ -155,10 +162,8 @@ public:
      */
     auto data()
     {
-        using IntVecType = std::decay_t<decltype(neighborsCount)>;
-        using KeyVecType = std::decay_t<decltype(codes)>;
-
-        using FieldType = std::variant<FieldVector<float>*, FieldVector<double>*, KeyVecType*, IntVecType*>;
+        using FieldType =
+            std::variant<FieldVector<float>*, FieldVector<double>*, FieldVector<unsigned>*, FieldVector<uint64_t>*>;
 
         return std::apply([](auto&... fields) { return std::array<FieldType, sizeof...(fields)>{&fields...}; },
                           dataTuple());
@@ -167,7 +172,7 @@ public:
     void setOutputFields(const std::vector<std::string>& outFields)
     {
         outputFieldNames   = outFields;
-        outputFieldIndices = fieldStringsToInt(outFields, fieldNames);
+        outputFieldIndices = cstone::fieldStringsToInt(outFields, fieldNames);
     }
 
     void resize(size_t size)
@@ -190,10 +195,6 @@ public:
     std::vector<int>         outputFieldIndices;
     std::vector<std::string> outputFieldNames;
 
-#ifdef USE_MPI
-    MPI_Comm comm;
-#endif
-
     constexpr static T sincIndex     = 6.0;
     constexpr static T Kcour         = 0.2;
     constexpr static T maxDtIncrease = 1.1;
@@ -201,8 +202,8 @@ public:
     // Min. Atwood number in ramp function in momentum equation (crossed/uncrossed selection)
     // Complete uncrossed option (Atmin>=1.d50, Atmax it doesn't matter).
     // Complete crossed (Atmin and Atmax negative)
-    constexpr static T Atmax = 0.1;
-    constexpr static T Atmin = 0.2;
+    constexpr static T Atmin = 0.1;
+    constexpr static T Atmax = 0.2;
     constexpr static T ramp  = 1.0 / (Atmax - Atmin);
 
     // AV switches floor and ceiling
@@ -217,6 +218,15 @@ public:
 template<typename T, typename I, class Acc>
 const T ParticlesData<T, I, Acc>::K = ::sph::compute_3d_k(sincIndex);
 
+//! @brief resizes the neighbors list, only used in the CPU version
+template<class Dataset>
+void resizeNeighbors(Dataset& d, size_t size)
+{
+    double growthRate = 1.05;
+    //! If we have a GPU, neighbors are calculated on-the-fly, so we don't need space to store them
+    reallocate(d.neighbors, cstone::HaveGpu<typename Dataset::AcceleratorType>{} ? 0 : size, growthRate);
+}
+
 template<class Dataset, std::enable_if_t<not cstone::HaveGpu<typename Dataset::AcceleratorType>{}, int> = 0>
 void transferToDevice(Dataset&, size_t, size_t, const std::vector<std::string>&)
 {
@@ -225,6 +235,12 @@ void transferToDevice(Dataset&, size_t, size_t, const std::vector<std::string>&)
 template<class Dataset, std::enable_if_t<not cstone::HaveGpu<typename Dataset::AcceleratorType>{}, int> = 0>
 void transferToHost(Dataset&, size_t, size_t, const std::vector<std::string>&)
 {
+}
+
+template<class Vector, class T, std::enable_if_t<not IsDeviceVector<Vector>{}, int> = 0>
+void fill(Vector& v, size_t first, size_t last, T value)
+{
+    std::fill(v.data() + first, v.data() + last, value);
 }
 
 } // namespace sphexa
